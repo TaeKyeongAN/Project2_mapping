@@ -61,7 +61,6 @@ def _set_layer_show_by_name(m: folium.Map, name_substrings, show: bool = True):
 
 def _wire_enf_legend_behavior_by_name(m, overlay_name="[단속] 히트맵(불법주정차)", legend_id="enf-legend"):
     """히트맵 오버레이가 켜질 때만 #enf-legend 보이기"""
-    from branca.element import Element
     js = f"""
     <script>
     (function() {{
@@ -92,6 +91,41 @@ def _wire_enf_legend_behavior_by_name(m, overlay_name="[단속] 히트맵(불법
     </script>
     """
     m.get_root().html.add_child(Element(js))
+
+# ---- 주차장 현황 탭에서 쓰는 헬퍼들 ----
+import geopandas as gpd
+from branca.element import Element
+
+def _inject_map_css(m):
+    css = Element("""
+    <style>
+      .leaflet-control-container .leaflet-top.leaflet-right { right: 12px !important; left: auto !important; }
+      .leaflet-control-layers { margin-top: 10px; }
+    </style>
+    """)
+    m.get_root().html.add_child(css)
+
+def _load_emd_cheonan(emd_path: Path, cheonan_geom):
+    """읍·면·동 경계를 천안시 영역으로 필터링해 GeoDataFrame으로 반환(없으면 빈 gdf)."""
+    if not Path(emd_path).exists():
+        return gpd.GeoDataFrame(columns=["EMD_NAME", "geometry"], geometry="geometry", crs="EPSG:4326")
+    try:
+        gdf = gpd.read_file(emd_path)
+        if gdf.crs is None:
+            gdf = gdf.set_crs(epsg=4326, allow_override=True)
+        else:
+            gdf = gdf.to_crs(epsg=4326)
+        # 이름 컬럼 추정
+        name_col = next((c for c in ["EMD_KOR_NM","EMD_NM","법정동명","adm_nm","emd_nm"] if c in gdf.columns), None)
+        gdf["EMD_NAME"] = gdf[name_col] if name_col else gdf.index.astype(str)
+        out = gdf[["EMD_NAME","geometry"]].copy()
+        # 천안시 영역으로 제한
+        if cheonan_geom is not None and len(out):
+            out = out.loc[out.geometry.centroid.within(cheonan_geom)].copy()
+        return out
+    except Exception:
+        return gpd.GeoDataFrame(columns=["EMD_NAME", "geometry"], geometry="geometry", crs="EPSG:4326")
+
 
 
 # === 코어 함수 ===
@@ -126,6 +160,7 @@ TRAFFIC_STATS_CSV    = str(DATA_DIR / "스마트교차로_통계.csv")
 ENFORCEMENT_CSV_23   = str(DATA_DIR / "천안시_단속장소_위도경도_23년.csv")
 ENFORCEMENT_CSV_24   = str(DATA_DIR / "천안시_단속장소_위도경도_24년.csv")
 POI_CAT_CSV          = str(DATA_DIR / "cheonan_POI_category_20250820_0949.csv") # ★ 최신 POI CSV
+EMD_SHP_PATH = DATA_DIR / "BND_ADM_DONG_PG" / "BND_ADM_DONG_PG.shp"
 
 MAP_CENTER_LAT, MAP_CENTER_LON = 36.815, 127.147
 MAP_ZOOM = 12
@@ -137,8 +172,14 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 # =========================
 # UI  (사이드바 제거, 한 장짜리 설정 카드로 통합)
 # =========================
+# =========================
+# UI (탭 네비게이션으로 상단 구성)
+# =========================
+# =========================
+# UI  (사이드바 제거, 상단 탭 구성)
+# =========================
 app_ui = ui.page_fluid(
-    # --- 컴팩트 스타일 (레이블 줄바꿈 방지/여백 축소) ---
+    # --- 컴팩트 스타일 (레이블 줄바꿈 방지/여백 축소 + 추천표 가로 스크롤) ---
     ui.tags.style("""
     .compact-controls .card-body{padding:12px;}
     .compact-controls .shiny-input-container{margin-bottom:8px;}
@@ -160,95 +201,129 @@ app_ui = ui.page_fluid(
     }
     """),
 
-    ui.h2("천안시 공영주차장 후보지 대시보드 (가중치 조정)"),
+    # 제목
+    ui.h2("천안시 주차장 추가 설치 후보지 추천"),
 
-    # ---- 사용자 설정 카드 (한 장에 모두) ----
-    ui.card(
-        ui.card_header("사용자 가중치/설정"),
-        ui.div({"class":"compact-controls"},
-            # 1행: 지표 가중치 / 격자 설정 / 추천(고혼잡) 설정
-            ui.row(
-                # 지표 가중치
-                ui.column(4,
-                    ui.h6("지표 가중치"),
-                    ui.input_slider("w_fac", "주변시설(수요)", min=0, max=100, value=33, step=1),
-                    ui.input_slider("w_trf", "교통량(유동)", min=0, max=100, value=33, step=1),
-                    ui.input_slider("w_enf", "불법주정차(압력)", min=0, max=100, value=34, step=1),
-                ),
-                # 격자 설정
-                ui.column(4,
-                    ui.h6("격자 설정"),
-                    ui.input_radio_buttons(
-                        "subgrid_n", "소격자(행=열)", 
-                        choices={"10":"10×10","5":"5×5"}, selected="10", inline=True
-                    ),
-                    ui.input_select(
-                        "refine_thr_select", "분할 기준(대격자 점수)",
-                        choices=[str(x) for x in range(5,51,5)], selected="5"
-                    ),
-                    ui.input_checkbox("local_norm", "소집단 내 0~100 재표준화", value=True),
-                ),
-                # 추천(고혼잡) 설정
-                ui.column(4,
-                    ui.h6("추천(고혼잡) 설정"),
+    # 상단 탭 네비게이션 (Main / 주차장 현황 / 부록1 / 부록2)
+    ui.navset_tab(
+
+        # ---- Main 탭: (기존 메인 화면 전부) ----
+        ui.nav_panel(
+            "Main",
+            # 사용자 설정 카드
+            ui.card(
+                ui.card_header("사용자 가중치/설정"),
+                ui.div({"class": "compact-controls"},
                     ui.row(
-                        ui.column(6,
-                            ui.input_select(
-                                "rec_thr_select", "추천 기준(점수)",
-                                choices=["100","95","90","85","80","75","70"], selected="90"
-                            ),
+                        # 지표 가중치
+                        ui.column(4,
+                            ui.h6("지표 가중치"),
+                            ui.input_slider("w_fac", "주변시설(수요)", min=0, max=100, value=33, step=1),
+                            ui.input_slider("w_trf", "교통량(유동)", min=0, max=100, value=33, step=1),
+                            ui.input_slider("w_enf", "불법주정차(단속)", min=0, max=100, value=34, step=1),
                         ),
-                        ui.column(6,
+                        # 격자 설정
+                        ui.column(4,
+                            ui.h6("격자 설정"),
+                            ui.input_radio_buttons(
+                                "subgrid_n", "소격자 개수",
+                                choices={"10": "10x10", "5": "5x5"},
+                                selected="10", inline=True
+                            ),
                             ui.input_select(
-                                "penalty_pub", "공영 1개당 차감",
-                                choices=["0","5","10","15","20"], selected="10"
+                                "refine_thr_select", "소격자로 분할하는 기준 점수 (대격자)",
+                                choices=[str(x) for x in range(5, 51, 5)], selected="5"
+                            ),
+                            ui.input_checkbox("local_norm", "소격자 내 0~100으로 혼잡도 점수 재표준화", value=True),
+                        ),
+                        # 추천(고혼잡) 설정
+                        ui.column(4,
+                            ui.h6("지역 추천 기준 설정"),
+                            ui.row(
+                                ui.column(6,
+                                    ui.input_select(
+                                        "rec_thr_select", "추천 기준(점수)",
+                                        choices=["100", "95", "90", "85", "80", "75", "70"], selected="90"
+                                    ),
+                                ),
+                                ui.column(6,
+                                    ui.input_select(
+                                        "penalty_pub", "공영 주차장 1개당 차감 점수",
+                                        choices=["0", "5", "10", "15", "20"], selected="10"
+                                    ),
+                                ),
+                            ),
+                            ui.row(
+                                ui.column(6,
+                                    ui.input_select(
+                                        "penalty_pri", "민영 주차장 1개당 차감 점수",
+                                        choices=[str(x) for x in range(0, 11)], selected="5"
+                                    ),
+                                ),
                             ),
                         ),
                     ),
+                    ui.hr(),
                     ui.row(
-                        ui.column(6,
-                            ui.input_select(
-                                "penalty_pri", "민영 1개당 차감",
-                                choices=[str(x) for x in range(0,11)], selected="5"
-                            ),
-                        ),
+                        ui.column(2, ui.h6("기타"), ui.input_checkbox("fast_mode", "빠른 로드", value=True)),
+                        ui.column(4, ui.download_button("dl_scores", "점수 CSV 다운로드", class_="btn-outline-secondary w-100")),
+                        ui.column(3),
+                        ui.column(3, ui.input_action_button("recalc", "지도 재계산", class_="btn-primary w-100")),
                     ),
                 ),
             ),
 
-            ui.hr(),
+            ui.br(),
 
-            # 2행: 기타(빠른 로드/버튼/다운로드) — 왼쪽으로 이동
+            # 지도(좌) + 추천표(우)
             ui.row(
-                ui.column(2, ui.h6("기타"), ui.input_checkbox("fast_mode", "빠른 로드", value=True)),
-                ui.column(4, ui.download_button("dl_scores", "점수 CSV 다운로드", class_="btn-outline-secondary w-100")),
-                ui.column(3),
-                ui.column(3, ui.input_action_button("recalc", "지도 재계산", class_="btn-primary w-100")),
+                ui.column(
+                    8,
+                    ui.card(
+                        ui.card_header("지도"),
+                        ui.output_ui("map_ui"),
+                        full_screen=True
+                    )
+                ),
+                ui.column(
+                    4,
+                    ui.card(
+                        ui.card_header("추천 격자(조정점수 기준)"),
+                        ui.output_table("recommend_table")
+                    )
+                )
             ),
         ),
-    ),
 
-    ui.br(),
-
-    # ---- 본문: 지도(좌) + 추천표(우) ----
-    ui.row(
-        ui.column(
-            8,
+        # ---- 주차장 현황 탭 ----
+        ui.nav_panel(
+            "주차장 현황",
             ui.card(
-                ui.card_header("지도"),
-                ui.output_ui("map_ui"),
-                full_screen=True
+                ui.card_header("천안시 공영/민영 주차장 현황"),
+                ui.output_ui("parking_status")  # 서버에서 ui.HTML(...) 또는 표/지도 구성
             )
         ),
-        ui.column(
-            4,
+
+        # ---- 부록1(배경) 탭 ----
+        ui.nav_panel(
+            "부록1(배경)",
             ui.card(
-                ui.card_header("추천 격자(조정점수 기준)"),
-                ui.output_table("recommend_table")
+                ui.card_header("주제 선정 배경"),
+                ui.output_ui("appendix1")  # 설명/이미지/차트 등
             )
-        )
+        ),
+
+        # ---- 부록2(설명) 탭 ----
+        ui.nav_panel(
+            "부록2(설명)",
+            ui.card(
+                ui.card_header("점수 산정 규칙 및 데이터 출처"),
+                ui.output_ui("appendix2")  # 점수 규칙/데이터 출처 표기
+            )
+        ),
     ),
 )
+
 
 
 
@@ -430,6 +505,13 @@ def server(input, output, session):
         if len(df_enf):
             df_enf = df_enf[df_enf.apply(lambda r: _inside(cheonan_geom, r["lon"], r["lat"]), axis=1)].reset_index(drop=True)
 
+        # ... base_data() 안, df_enf 처리 아래에 이어서 추가 ...
+        # 읍·면·동 (없으면 빈 gdf)
+        try:
+            emd_gdf = _load_emd_cheonan(EMD_SHP_PATH, cheonan_geom)
+        except Exception:
+            emd_gdf = gpd.GeoDataFrame(columns=["EMD_NAME","geometry"], geometry="geometry", crs="EPSG:4326")
+
         return dict(
             cheonan_geom=cheonan_geom,
             cheonan_gdf=cheonan_gdf,
@@ -438,8 +520,10 @@ def server(input, output, session):
             df_pub=df_pub,
             df_pri=df_pri,
             df_sensors=df_sensors,
-            df_enf=df_enf
+            df_enf=df_enf,
+            emd_gdf=emd_gdf
         )
+
 
     # 점수 결합
     def _apply_weights(df: pd.DataFrame, w_fac: float, w_trf: float, w_enf: float, local_norm: bool):
@@ -559,12 +643,12 @@ def server(input, output, session):
                 fg_city = folium.FeatureGroup(name="[경계] 천안시", show=True)
                 folium.GeoJson(
                     bd["cheonan_gdf"], name="[경계] 천안시(halo)",
-                    style_function=lambda x: {"color": "#FFFFFF", "weight": 7, "opacity": 0.9},
+                    style_function=lambda x: {"color": "#000000", "weight": 7, "opacity": 0.9},
                     control=False
                 ).add_to(fg_city)
                 folium.GeoJson(
                     bd["cheonan_gdf"], name="[경계] 천안시(선)",
-                    style_function=lambda x: {"color": "#00E5FF", "weight": 3.5, "opacity": 1.0},
+                    style_function=lambda x: {"color": "#FFFFFF", "weight": 3.5, "opacity": 1.0},
                     control=False
                 ).add_to(fg_city)
                 fg_city.add_to(m)
@@ -686,6 +770,127 @@ def server(input, output, session):
                     err = traceback.format_exc()
                     print("[DEBUG] map_and_scores ERROR:\n", err)
                     return {"map": None, "grid_scores": pd.DataFrame(), "sub_scores": pd.DataFrame(), "error": err}
+        
+    # -------------------------
+    # 주차장 현황 탭 전용 지도
+    # -------------------------
+    @reactive.calc
+    def build_parking_map():
+        bd = base_data()  # 기존 로딩 재사용
+
+        m = folium.Map(location=[MAP_CENTER_LAT, MAP_CENTER_LON], zoom_start=MAP_ZOOM, tiles=None)
+
+        # 베이스맵: VWorld → 실패 시 OSM/Carto/Esri
+        try:
+            add_vworld_base_layers(m)  # 위성 + 라벨
+            folium.TileLayer("CartoDB positron", name="밝은 지도 (Carto Positron)", show=False).add_to(m)
+        except Exception:
+            folium.TileLayer(
+                tiles="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                name="OSM 기본", attr="&copy;OSM", show=False
+            ).add_to(m)
+            folium.TileLayer("CartoDB positron", name="밝은 지도 (Carto Positron)", show=True).add_to(m)
+            folium.TileLayer("Esri.WorldImagery", name="위성 (Esri)", show=False).add_to(m)
+
+        _inject_map_css(m)
+        m.add_child(MiniMap(position="bottomright", toggle_display=True))
+
+        # [경계] 천안시 (halo + 본선)
+        try:
+            if bd["cheonan_gdf"] is not None:
+                folium.GeoJson(
+                    bd["cheonan_gdf"],
+                    name="[경계] 천안시 (halo)",
+                    style_function=lambda x: {"color": "#FFFFFF", "weight": 7, "opacity": 0.9},
+                    control=False,
+                ).add_to(m)
+                folium.GeoJson(
+                    bd["cheonan_gdf"],
+                    name="[경계] 천안시",
+                    style_function=lambda x: {"color": "#00E5FF", "weight": 3.5, "opacity": 1.0},
+                    highlight_function=lambda x: {"weight": 5, "color": "#FFFFFF"},
+                ).add_to(m)
+        except Exception as e:
+            print("[WARN] draw city:", e)
+
+        # [경계] 동남구/서북구
+        try:
+            gm = bd.get("gu_map") or {}
+            if gm.get("동남구") is not None and len(gm["동남구"]):
+                folium.GeoJson(
+                    gm["동남구"], name="[경계] 동남구",
+                    style_function=lambda x: {"color":"#BA2FE5","weight":3,"opacity":1.0},
+                    highlight_function=lambda x: {"weight":4,"color":"#FFFFFF"},
+                ).add_to(m)
+            if gm.get("서북구") is not None and len(gm["서북구"]):
+                folium.GeoJson(
+                    gm["서북구"], name="[경계] 서북구",
+                    style_function=lambda x: {"color":"#FF5722","weight":3,"opacity":1.0},
+                    highlight_function=lambda x: {"weight":4,"color":"#FFFFFF"},
+                ).add_to(m)
+        except Exception as e:
+            print("[WARN] draw gus:", e)
+
+        # [경계] 읍·면·동
+        try:
+            emd = bd.get("emd_gdf")
+            if emd is not None and len(emd):
+                emd_group = folium.FeatureGroup(name="[경계] 읍·면·동", show=True)
+                folium.GeoJson(
+                    emd,
+                    style_function=lambda x: {"color":"#FFFFFF","weight":6.5,"opacity":1.0,"fill":False},
+                    control=False,
+                ).add_to(emd_group)
+                folium.GeoJson(
+                    emd,
+                    style_function=lambda x: {"color":"#222222","weight":3.0,"opacity":1.0,"fill":False},
+                    highlight_function=lambda x: {"weight":3.6,"color":"#000000"},
+                    tooltip=folium.GeoJsonTooltip(fields=["EMD_NAME"], aliases=["읍·면·동:"], sticky=True),
+                    control=False,
+                ).add_to(emd_group)
+                emd_group.add_to(m)
+        except Exception as e:
+            print("[WARN] draw emd:", e)
+
+        # [주차장] 공영(파랑)
+        try:
+            df_pub = bd["df_pub"]
+            if isinstance(df_pub, pd.DataFrame) and len(df_pub):
+                fg_pub = folium.FeatureGroup(name="[주차장] 공영 (파랑)", show=True)
+                for _, r in df_pub.iterrows():
+                    lat = float(r.get("lat", np.nan)); lon = float(r.get("lon", np.nan))
+                    if np.isnan(lat) or np.isnan(lon): continue
+                    name = str(r.get("name", r.get("주차장명", "공영주차장")))
+                    folium.Marker(
+                        [lat, lon], tooltip=name,
+                        popup=folium.Popup(f"<b>{name}</b>", max_width=300),
+                        icon=folium.Icon(color="blue", icon="car", prefix="fa")
+                    ).add_to(fg_pub)
+                fg_pub.add_to(m)
+        except Exception as e:
+            print("[WARN] draw pub:", e)
+
+        # [주차장] 민영(빨강)
+        try:
+            df_pri = bd["df_pri"]
+            if isinstance(df_pri, pd.DataFrame) and len(df_pri):
+                fg_pri = folium.FeatureGroup(name="[주차장] 민영 (빨강)", show=True)
+                for _, r in df_pri.iterrows():
+                    lat = float(r.get("lat", np.nan)); lon = float(r.get("lon", np.nan))
+                    if np.isnan(lat) or np.isnan(lon): continue
+                    name = str(r.get("name", r.get("주차장명", "민영주차장")))
+                    folium.Marker(
+                        [lat, lon], tooltip=name,
+                        popup=folium.Popup(f"<b>{name}</b>", max_width=300),
+                        icon=folium.Icon(color="red", icon="car", prefix="fa")
+                    ).add_to(fg_pri)
+                fg_pri.add_to(m)
+        except Exception as e:
+            print("[WARN] draw pri:", e)
+
+        folium.LayerControl(collapsed=False, position="topright").add_to(m)
+        return m
+
 
     # --- 출력부 ---
     @output
@@ -698,6 +903,16 @@ def server(input, output, session):
                 if data.get("map") is not None
                 else folium.Map(location=[MAP_CENTER_LAT, MAP_CENTER_LON], zoom_start=MAP_ZOOM)._repr_html_())
         return ui.div(ui.HTML(html), style="height: 78vh; min-height: 600px; border-radius: 8px; overflow: hidden;")
+    
+    @output
+    @render.ui
+    def parking_status():
+        m = build_parking_map()
+        return ui.div(
+            ui.HTML(m._repr_html_()),
+            style="height: 78vh; min-height: 600px; border-radius: 8px; overflow: hidden;"
+        )
+
 
 
     @render.download(filename=lambda: f"cheonan_scores_{datetime.now().strftime('%Y%m%d_%H%M')}.zip")
@@ -731,8 +946,8 @@ def server(input, output, session):
             "centroid_lat": "위도",
             "centroid_lon": "경도",
             "score_weighted_100": "원점수(0~100)",
-            "public_count": "공영수",
-            "private_count": "민영수",
+            "public_count": "공영 주차장 수",
+            "private_count": "민영 주차장 수",
             "adjusted_score": "조정점수",
             "address_hint": "행정동",
         }).copy()
